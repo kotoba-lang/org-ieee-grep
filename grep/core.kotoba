@@ -60,37 +60,83 @@ b" 1 2))
 ;; The final piece is emitted WITH a newline whether or not the file ended in
 ;; one -- that is grep's contract, measured, and it is why this cannot simply
 ;; re-emit the matched span of the original bytes.
-(defn walk [text :string needle :string acc :i64] :i64
+(defn walk [text :string needle :string prefix :string acc :i64] :i64
   (let [i (string-index-of text "\n")]
     (if (< i 0)
       (if (= (string-byte-length text) 0)
         acc
         (if (>= (string-index-of text needle) 0)
-          (do (emit text) (emit (nl)) (+ acc 1))
+          (do (emit prefix) (emit text) (emit (nl)) (+ acc 1))
           acc))
       (let [line (string-substring text 0 i)
             rest (string-substring text (+ i 1) (string-byte-length text))]
-        (walk rest needle
+        (walk rest needle prefix
               (if (>= (string-index-of line needle) 0)
-                (do (emit line) (emit (nl)) (+ acc 1))
+                (do (emit prefix) (emit line) (emit (nl)) (+ acc 1))
                 acc))))))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
+
+;; `grep: PATH: No such file or directory`, exit 2 -- grep and sort exit 2
+;; here where cat, wc, head and uniq exit 1. Measured on each, not copied
+;; from a sibling.
+(defn complain [path :string] :i64
+  (do
+    (emit-error "grep: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    2))
+
+;; --- several operands ----------------------------------------------------
+;;
+;; With TWO OR MORE files every matching line is prefixed `FILE:`, and with
+;; one it is not. Measured against /usr/bin/grep -F 2026-09-10. The prefix is
+;; the operand exactly as written, not a resolved path.
+;;
+;; The exit status is a three-way worst-of, and its order is the part that is
+;; easy to get wrong: an unreadable operand (2) beats a match (0), which
+;; beats no match (1). Measured: `grep -F alpha a.txt missing.txt` prints
+;; a.txt's match, complains about missing.txt, and exits 2 -- not 0.
+;; Carried here as `worst`, where 2 is sticky and a match downgrades 1 to 0.
+(defn worse [a :i64 b :i64] :i64
+  (if (= a 2) 2 (if (= b 2) 2 (if (= a 0) 0 b))))
+
+;; Scanning one file, with the prefix decided by the caller. Returns 0 when
+;; something matched and 1 when nothing did.
+(defn scan [path :string needle :string prefix :string] :i64
+  (if (> (walk (slurp-file path) needle prefix 0) 0) 0 1))
+
+(defn each [i :i64 total :string needle :string prefix? :i64 worst :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (each (+ i 1) total needle prefix?
+              (worse worst
+                     (scan path needle
+                           (if (= prefix? 1) (string-concat path ":") ""))))
+        (each (+ i 1) total needle prefix? (worse worst (complain path)))))))
 
 (defn main [] :i64
   (let [needle (arg "0")
-        path (arg "1")]
+        total (arg "")]
     ;; An empty pattern would trap: string-index-of refuses an empty needle,
     ;; and that refusal is a language invariant rather than a gap. grep -F ''
     ;; matches every line; this refuses with exit 2 instead of pretending,
     ;; and the README says so.
     (if (= (string-byte-length needle) 0)
       2
-      (if (readable? path)
-        (if (> (walk (slurp-file path) needle 0) 0) 0 1)
-        ;; `grep: PATH: No such file or directory`, exit 2 -- grep and sort
-        ;; exit 2 here where cat, wc, head and uniq exit 1.
-        (do
-          (emit-error "grep: ")
-          (emit-error path)
-          (emit-error ": No such file or directory")
-          (emit-error (nl))
-          2)))))
+      ;; No file operand at all. POSIX grep reads standard input; there is no
+      ;; stdin capability, so this refuses rather than pretending to have
+      ;; read an empty one -- which would exit 1 and look like "no match".
+      (if (string=? total "1")
+        2
+        (each 1 total needle (if (string=? total "2") 0 1) 1)))))

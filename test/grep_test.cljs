@@ -36,17 +36,23 @@
 ;; and each is here because it separates a right implementation from a wrong
 ;; one that passes the others:
 ;;
-;;   one file           -- the basic contract
-;;   two files          -- concatenated in ORDER, with nothing added between
-;;   the same file twice-- an operand is not deduplicated
-;;   an EMPTY file      -- reads as the empty string, which must not end the
-;;                         loop the way "past the last operand" does
-;;   empty then content -- the same trap from the other side
-;;   no trailing newline-- cat adds nothing of its own
-;;   binary-ish bytes   -- high bytes survive the round trip
-;;   no operands        -- POSIX reads stdin; there is no stdin capability,
-;;                         so this asserts what it ACTUALLY does (nothing),
-;;                         not what POSIX says
+;;   a match / no match  -- exit 0 and exit 1, which grep uses as an answer
+;;                          rather than as a health report
+;;   an EMPTY file       -- reads as the empty string, which must not end the
+;;                          line walk the way "no more lines" does
+;;   no trailing newline -- grep ADDS one to a matched last line
+;;   a substring match   -- `alpha` matches `alphabet` too
+;;   a metacharacter     -- `a.c` matches literally under -F, so the
+;;                          comparison is against -F and the README says so
+;;   multi-byte          -- matched and unmatched, so the walk is not just
+;;                          counting bytes
+;;   TWO OR MORE files   -- every matching line gains a `FILE:` prefix, and
+;;                          with one file it gains none
+;;   a missing operand   -- among good ones, where the error status must beat
+;;                          the match status
+;;
+;; The prefix and the exit precedence are the two that a single-file
+;; implementation passes everything else without.
 (def fixtures
   {"words"  "alpha\nbeta\ngamma\nalphabet\n"
    "none"   "no match here\n"
@@ -79,7 +85,32 @@
    ;; A MISSING operand: matched on stderr and exit status since wire 35
    ;; gained an EXISTS form. Every utility words this differently --
    ;; measured on each, not copied from a sibling.
-   ["x" "missing"]])
+   ["x" "missing"]
+   ;; --- two or more operands ------------------------------------------
+   ;; With two files every matching line is prefixed `FILE:`; with one it is
+   ;; not. The prefix is the operand as written.
+   ["alpha" "words" "one"] ["x" "words" "one"]
+   ;; A match in only the SECOND file, so the prefix cannot come from the
+   ;; first operand by accident.
+   ["x" "none" "one"]
+   ;; No match in either: exit 1 and nothing written.
+   ["zzz" "words" "one"]
+   ;; The same operand twice is not de-duplicated, and each line carries the
+   ;; prefix separately.
+   ["alpha" "words" "words"]
+   ;; An empty file among the operands contributes nothing but must not end
+   ;; the walk.
+   ["x" "empty" "one"] ["x" "one" "empty"]
+   ;; Three operands.
+   ["a" "words" "rep" "meta"]
+   ;; The exit-status precedence: a match AND an unreadable operand. grep
+   ;; exits 2, not 0 -- the error outranks the match. A worst-of that simply
+   ;; kept the last answer, or that let 0 win, passes every case above.
+   ["alpha" "words" "missing"] ["alpha" "missing" "words"]
+   ;; No match and an unreadable operand: still 2, not 1.
+   ["zzz" "words" "missing"]
+   ;; Multi-byte with a prefix.
+   ["\u65e5\u672c" "utf8" "words"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -131,9 +162,19 @@
     ;; Now the only thing that matters: run it.
     (let [results
           (for [names cases]
-            ;; [PATTERN FILE]: only the second is a path.
-            (let [argv [(first names)
-                        (.join path (.realpathSync fs (.join path tmp "data")) (second names))]
+            ;; [PATTERN FILE...]: the first element is the pattern and
+            ;; EVERY remaining one is a path.
+            ;;
+            ;; This built `[(first names) (second names)]` until 2026-09-10,
+            ;; which silently dropped every operand past the second. The
+            ;; twelve multi-operand cases added that day all PASSED against
+            ;; it, because both implementations were handed one file and
+            ;; agreed about it -- a suite that could not have failed. The
+            ;; giveaway was in the output: cases naming three files printed
+            ;; the first file's lines with no `FILE:` prefix anywhere.
+            (let [argv (into [(first names)]
+                             (map #(.join path (.realpathSync fs (.join path tmp "data")) %)
+                                  (rest names)))
                   k (run exe argv {})
                   s (run system-grep (into ["-F"] argv) {})
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
