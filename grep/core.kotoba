@@ -1,0 +1,72 @@
+;; grep -- fixed-string line search, in the shape of POSIX grep
+;; (IEEE Std 1003.1) restricted to `-F`.
+;;
+;;   grep PATTERN FILE     the lines containing PATTERN
+;;
+;; Exit 0 when at least one line matched, 1 when none did. That status IS the
+;; answer for a caller in a pipeline, which is why it is asserted alongside
+;; the bytes.
+;;
+;; ## Fixed string, not a regular expression
+;;
+;; POSIX grep reads its pattern as a basic regular expression; this reads it
+;; literally, which is `grep -F`. Measured 2026-09-10 on a file holding
+;; `a.c` and `abc`: `grep 'a.c'` answers both lines and `grep -F 'a.c'`
+;; answers one. The test compares against `-F` and says so, rather than
+;; comparing against a different operation and calling the difference a bug.
+;;
+;; ## The newline grep ADDS
+;;
+;; A matched last line without a trailing newline is printed WITH one.
+;; Measured: a 20-byte file whose only line has no newline produces 21 bytes.
+;; This is the opposite of `head`, which adds nothing -- two commands, two
+;; contracts, and the only way to know which is which is to run them.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37).
+(ns grep.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+;; Walk the text line by line, emitting the ones that contain NEEDLE.
+;; Answers the number of lines emitted, which `main` turns into the exit
+;; status.
+;;
+;; The final piece is emitted WITH a newline whether or not the file ended in
+;; one -- that is grep's contract, measured, and it is why this cannot simply
+;; re-emit the matched span of the original bytes.
+(defn walk [text :string needle :string acc :i64] :i64
+  (let [i (string-index-of text "\n")]
+    (if (< i 0)
+      (if (= (string-byte-length text) 0)
+        acc
+        (if (>= (string-index-of text needle) 0)
+          (do (emit text) (emit (nl)) (+ acc 1))
+          acc))
+      (let [line (string-substring text 0 i)
+            rest (string-substring text (+ i 1) (string-byte-length text))]
+        (walk rest needle
+              (if (>= (string-index-of line needle) 0)
+                (do (emit line) (emit (nl)) (+ acc 1))
+                acc))))))
+
+(defn main [] :i64
+  (let [needle (arg "0")
+        path (arg "1")]
+    ;; An empty pattern would trap: string-index-of refuses an empty needle,
+    ;; and that refusal is a language invariant rather than a gap. grep -F ''
+    ;; matches every line; this refuses with exit 2 instead of pretending,
+    ;; and the README says so.
+    (if (= (string-byte-length needle) 0)
+      2
+      (if (> (walk (slurp-file path) needle 0) 0) 0 1))))
