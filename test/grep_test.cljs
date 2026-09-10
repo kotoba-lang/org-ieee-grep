@@ -9,7 +9,13 @@
 ;; and calling the difference a bug.
 ;;
 ;; The exit status is asserted with the bytes because for grep it IS the
-;; answer: 0 when something matched, 1 when nothing did.
+;; answer: 0 when something was selected, 1 when nothing was, 2 when an
+;; operand could not be read.
+;;
+;; One flag at a time: -i, -v, -c, -n, -l. Combining them is out of scope and
+;; is not compared here -- the guest exits 2 on any dashed argument 0 it does
+;; not implement, and /usr/bin/grep prints a usage block, so a case over `-in`
+;; would be asserting a difference nobody intends to remove.
 
 (ns grep-test
   (:require [clojure.string :as str] ["fs" :as fs] ["path" :as path] ["os" :as os]))
@@ -50,6 +56,9 @@
 ;;                          with one file it gains none
 ;;   a missing operand   -- among good ones, where the error status must beat
 ;;                          the match status
+;;   ONE flag            -- -i, -v, -c, -n, -l, each alone and each with
+;;                          several files, because every one of them changes
+;;                          what the `FILE:` prefix means
 ;;
 ;; The prefix and the exit precedence are the two that a single-file
 ;; implementation passes everything else without.
@@ -64,7 +73,19 @@
    "rep"    "aaa\n"
    ;; A metacharacter, so that -F is doing something observable.
    "meta"   "a.c\nabc\n"
-   "utf8"   "\u65e5\u672c\u8a9e\n\u00e9clair\nplain\n"})
+   "utf8"   "\u65e5\u672c\u8a9e\n\u00e9clair\nplain\n"
+   ;; Three spellings of one word, so -i has something to fold in BOTH
+   ;; directions -- a lowercase needle must reach `Alpha`, and an uppercase
+   ;; needle must reach `alpha`.
+   "mixed"  "Alpha\nALPHA\nalpha\nBeta\n"
+   ;; EMPTY lines, which -v selects and the folding walk must survive. An
+   ;; empty line is not the end of the walk, and `string-index-of` on an
+   ;; empty haystack has to answer -1 rather than trap.
+   "blank"  "alpha\n\nbeta\n\n"
+   ;; The one place this is NARROWER than the system utility: U+00C9 and
+   ;; U+00E9 are one letter to /usr/bin/grep -i and two here. Used by the
+   ;; divergence assertion below, never by a case that claims agreement.
+   "acc"    "\u00c9clair\n\u00e9clair\n"})
 
 ;; PATTERN then FILE. Each case separates a right implementation from a wrong
 ;; one that passes the others:
@@ -110,7 +131,107 @@
    ;; No match and an unreadable operand: still 2, not 1.
    ["zzz" "words" "missing"]
    ;; Multi-byte with a prefix.
-   ["\u65e5\u672c" "utf8" "words"]])
+   ["\u65e5\u672c" "utf8" "words"]
+
+   ;; --- ONE flag, found by SHAPE ---------------------------------------
+   ;;
+   ;; Argument 0 is the flag when it STARTS WITH `-`, never when the argument
+   ;; COUNT says so. `["-c" "alpha" "words"]` and `["alpha" "words" "one"]`
+   ;; are both three arguments and mean entirely different things, and both
+   ;; are in this list on purpose -- a length test passes one and ruins the
+   ;; other.
+
+   ;; -i: ASCII case folding, in both directions.
+   ["-i" "alpha" "mixed"]            ; lowercase needle reaching `Alpha`
+   ["-i" "ALPHA" "mixed"]            ; uppercase needle reaching `alpha`
+   ["-i" "Beta" "mixed"]             ; mixed needle, one line
+   ["-i" "zzz" "mixed"]              ; nothing folds into a match: exit 1
+   ["-i" "PLAIN" "utf8"]             ; an ASCII needle in a non-ASCII file
+   ["-i" "\u65e5\u672c" "utf8"]        ; a needle with no case at all
+   ["-i" "alpha" "blank"]            ; empty lines survive the fold
+   ["-i" "ALPHA" "blank"]            ; ... and the fold RUNS over them: with
+                                     ; the fold removed this one goes red,
+                                     ; where the line above stays green
+   ["-i" "alpha" "mixed" "words"]    ; folding AND the file prefix
+   ["-i" "alpha" "mixed" "missing"]  ; folding AND the error status
+
+   ;; -v: the lines that do NOT match, and the status follows what was
+   ;; PRINTED rather than what matched.
+   ["-v" "alpha" "words"]
+   ["-v" "a" "words"]                ; every line matches: nothing out, exit 1
+   ["-v" "tail" "nonl"]              ; the only line matches: exit 1
+   ["-v" "zzz" "nonl"]               ; and here -v still ADDS the newline
+   ["-v" "alpha" "blank"]            ; empty lines are selected BY -v
+   ["-v" "a" "empty"]                ; an empty file selects nothing
+   ["-v" "alpha" "words" "one"]      ; -v with the file prefix
+   ["-v" "alpha" "words" "missing"]
+
+   ;; -c: a COUNT per file, and the count is printed even when it is zero.
+   ["-c" "alpha" "words"]            ; 2
+   ["-c" "zzz" "words"]              ; prints `0` AND exits 1
+   ["-c" "a" "rep"]                  ; a line matching twice counts ONCE
+   ["-c" "tail" "nonl"]              ; the unterminated last line counts
+   ["-c" "a" "empty"]                ; 0
+   ["-c" "alpha" "words" "one"]      ; `words:2` then `one:0` -- the prefix
+                                     ; reaches -c, and 0 is still a line
+   ["-c" "zzz" "words" "one"]        ; two zeroes, exit 1
+   ["-c" "alpha" "words" "missing"]  ; NO line for the unreadable operand
+
+   ;; -n: a 1-based line number, after the file prefix and before the line.
+   ["-n" "alpha" "words"]            ; 1: and 4:, not 1: and 2:
+   ["-n" "a" "words"]                ; 1..4
+   ["-n" "tail" "nonl"]              ; numbered AND newline-terminated
+   ["-n" "zzz" "words"]              ; nothing, exit 1
+   ["-n" "alpha" "blank"]            ; empty lines are counted, not skipped
+   ["-n" "alpha" "words" "one"]      ; `words:1:alpha` -- prefix, THEN number
+   ["-n" "a" "words" "rep"]          ; the number RESETS at the second file
+   ["-n" "alpha" "words" "missing"]
+
+   ;; -l: the name of each file with a match, once.
+   ["-l" "alpha" "words"]            ; TWO matches, ONE line, and no colon
+   ["-l" "alpha" "none"]             ; nothing, exit 1
+   ["-l" "a" "empty"]                ; nothing, exit 1
+   ["-l" "alpha" "words" "one"]      ; only the file that matched
+   ["-l" "alpha" "words" "words"]    ; the same operand twice is not merged
+   ["-l" "a" "words" "rep" "meta"]   ; three files, in operand order
+   ["-l" "zzz" "words" "one"]        ; nothing, exit 1
+   ["-l" "alpha" "words" "missing"]])
+
+;; --- where this is NARROWER than the system utility ----------------------
+;;
+;; `-i` folds ASCII A-Z and nothing else, because there is no case-folding
+;; builtin on this surface and the fold is twenty-six hand-written
+;; replacements. /usr/bin/grep in en_US.UTF-8 folds U+00C9 to U+00E9; this
+;; does not.
+;;
+;; That belongs in the suite as a DIVERGENCE rather than in the README alone.
+;; A case in the list above would simply fail; a line missing from the list
+;; would say nothing at all. This asserts both sides by name, so the day
+;; someone implements Unicode folding this check goes red and asks for the
+;; README to be corrected -- which is the only way a documented limit stays
+;; true.
+(def divergences
+  [{:argv ["-i" "\u00c9" "acc"]
+    :why "U+00C9 folds to U+00E9 for /usr/bin/grep and not here"
+    :kotoba "\u00c9clair\n"
+    :system "\u00c9clair\n\u00e9clair\n"}])
+
+;; The argv a case names, with every FILE operand made absolute and the
+;; pattern left alone.
+;;
+;; Which element is the pattern is decided by SHAPE, exactly as the guest
+;; decides it: argument 0 is the flag when it starts with `-`, so the pattern
+;; is element 1 there and element 0 otherwise. Deciding it by LENGTH would
+;; make `["-c" "alpha" "words"]` and `["alpha" "words" "one"]` the same shape
+;; and quietly hand `-c` two files.
+;;
+;; This is the line that stopped the suite from being able to fail once
+;; already -- see the note below on the twelve multi-operand cases.
+(defn- argv-for [names data]
+  (let [flagged? (str/starts-with? (first names) "-")
+        head (if flagged? (take 2 names) (take 1 names))
+        files (if flagged? (drop 2 names) (drop 1 names))]
+    (into (vec head) (map #(.join path data %) files))))
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -172,9 +293,7 @@
             ;; agreed about it -- a suite that could not have failed. The
             ;; giveaway was in the output: cases naming three files printed
             ;; the first file's lines with no `FILE:` prefix anywhere.
-            (let [argv (into [(first names)]
-                             (map #(.join path (.realpathSync fs (.join path tmp "data")) %)
-                                  (rest names)))
+            (let [argv (argv-for names (.realpathSync fs (.join path tmp "data")))
                   k (run exe argv {})
                   s (run system-grep (into ["-F"] argv) {})
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
@@ -186,12 +305,32 @@
               {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
                :system (.toString (:out s) "utf8")
                :exit [(:status k) (:status s)]}))
-          bad (remove :ok results)]
+          ;; The documented -i limit, asserted from BOTH sides. Each of these
+          ;; is green only when this command answers exactly what it claims to
+          ;; answer AND the system utility answers exactly what the README
+          ;; says it answers -- and the two differ. So it goes red if either
+          ;; side changes, and a stale claim in the README cannot survive.
+          divs
+          (for [d divergences]
+            (let [data (.realpathSync fs (.join path tmp "data"))
+                  argv (argv-for (:argv d) data)
+                  k (.toString (:out (run exe argv {})) "utf8")
+                  y (.toString (:out (run system-grep (into ["-F"] argv) {})) "utf8")]
+              {:argv (:argv d) :why (:why d)
+               :ok (and (= k (:kotoba d)) (= y (:system d)) (not= k y))
+               :kotoba k :system y}))
+          bad (concat (remove :ok results) (remove :ok divs))]
       (doseq [r results]
         (println (str (if (:ok r) "  ok   " "  FAIL ")
                       (pr-str (:argv r))
                       " -> " (pr-str (:kotoba r))
                       (when-not (:ok r) (str " but " system-grep " says " (pr-str (:system r))
                                              " exits " (pr-str (:exit r))))))) 
-      (println (pr-str {:ok (empty? bad) :cases (count results) :failed (count bad)}))
+      (doseq [d divs]
+        (println (str (if (:ok d) "  ok   " "  FAIL ") "DIVERGES "
+                      (pr-str (:argv d)) " -- " (:why d)
+                      " -> " (pr-str (:kotoba d))
+                      " vs " (pr-str (:system d)))))
+      (println (pr-str {:ok (empty? bad) :cases (+ (count results) (count divs))
+                        :divergences (count divs) :failed (count bad)}))
       (.exit js/process (if (seq bad) 1 0)))))

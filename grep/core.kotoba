@@ -1,11 +1,11 @@
 ;; grep -- fixed-string line search, in the shape of POSIX grep
 ;; (IEEE Std 1003.1) restricted to `-F`.
 ;;
-;;   grep PATTERN FILE     the lines containing PATTERN
+;;   grep [-i|-v|-c|-n|-l] PATTERN FILE...
 ;;
-;; Exit 0 when at least one line matched, 1 when none did. That status IS the
-;; answer for a caller in a pipeline, which is why it is asserted alongside
-;; the bytes.
+;; Exit 0 when at least one line was selected, 1 when none was, 2 when an
+;; operand could not be read. That status IS the answer for a caller in a
+;; pipeline, which is why it is asserted alongside the bytes.
 ;;
 ;; ## Fixed string, not a regular expression
 ;;
@@ -19,10 +19,22 @@
 ;;
 ;; A matched last line without a trailing newline is printed WITH one.
 ;; Measured: a 20-byte file whose only line has no newline produces 21 bytes.
-;; This is the opposite of `head`, which adds nothing -- two commands, two
+;; This is the opposite of head, which adds nothing -- two commands, two
 ;; contracts, and the only way to know which is which is to run them.
 ;;
-;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37).
+;; ## ONE flag, found by SHAPE
+;;
+;; Argument 0 is the flag when it STARTS WITH `-`, and the pattern otherwise.
+;; It is deliberately not the argument COUNT: `-c alpha words` and
+;; `alpha words one` are both three arguments and mean entirely different
+;; things, and both are in the suite for that reason. Sibling commands in
+;; this family have carried exactly that bug.
+;;
+;; Combining flags (`-in`, `-vc`) is out of scope and exits 2 rather than
+;; guessing; so does any other dashed argument 0.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/write-error (39).
 (ns grep.core (:export [main]))
 
 (defn arg [i :string] :string
@@ -53,40 +65,130 @@
   (string-substring "a
 b" 1 2))
 
-;; Walk the text line by line, emitting the ones that contain NEEDLE.
-;; Answers the number of lines emitted, which `main` turns into the exit
-;; status.
-;;
-;; The final piece is emitted WITH a newline whether or not the file ended in
-;; one -- that is grep's contract, measured, and it is why this cannot simply
-;; re-emit the matched span of the original bytes.
-(defn walk [text :string needle :string prefix :string acc :i64] :i64
-  (let [i (string-index-of text "\n")]
-    (if (< i 0)
-      (if (= (string-byte-length text) 0)
-        acc
-        (if (>= (string-index-of text needle) 0)
-          (do (emit prefix) (emit text) (emit (nl)) (+ acc 1))
-          acc))
-      (let [line (string-substring text 0 i)
-            rest (string-substring text (+ i 1) (string-byte-length text))]
-        (walk rest needle prefix
-              (if (>= (string-index-of line needle) 0)
-                (do (emit prefix) (emit line) (emit (nl)) (+ acc 1))
-                acc))))))
-
 (defn digit-text [d :i64] :string
   (string-substring "0123456789" d (+ d 1)))
 
+;; Numbers cross the wire as decimal TEXT, so `-c` and `-n` render their own
+;; digits. There is no number-to-string on this surface; there is a digit
+;; walk, and this is it.
 (defn decimal-of [n :i64] :string
   (if (< n 10)
     (digit-text n)
     (string-concat (decimal-of (quot n 10))
                    (digit-text (- n (* 10 (quot n 10)))))))
 
+;; --- the flag ------------------------------------------------------------
+;;
+;; Two counters have to survive the line walk -- the line number for `-n` and
+;; the number of lines selected for the exit status -- and a function here
+;; carries at most five parameters (`kotoba.compiler.frontend/max-parameters`).
+;; They are packed into one i64 instead: line number above the unit, selected
+;; count below it.
+(defn line-unit [] :i64 1000000000)
+
+;; 0 no flag, 1 `-i`, 2 `-v`, 3 `-c`, 4 `-n`, 5 `-l`, -1 a dashed argument
+;; this does not implement.
+;;
+;; The test is `string-code-point-at`, not `string-substring s 0 1`: a
+;; substring offset must land on a code-point boundary, and a pattern whose
+;; first character is multi-byte would be cut in half by a hand-made 1. The
+;; code point 45 is `-`.
+(defn mode-of [] :i64
+  (let [head (arg "0")]
+    (if (= (string-byte-length head) 0)
+      0
+      (if (= (string-code-point-at head 0) 45)
+        (if (string=? head "-i") 1
+            (if (string=? head "-v") 2
+                (if (string=? head "-c") 3
+                    (if (string=? head "-n") 4
+                        (if (string=? head "-l") 5
+                            (- 0 1))))))
+        0))))
+
+;; --- ASCII case folding, and only ASCII ----------------------------------
+;;
+;; There is no case-folding builtin on this surface, so `-i` folds by hand:
+;; twenty-six replacements, A-Z to a-z, over both the needle and each line.
+;;
+;; This is NARROWER than the system utility and the README says so. Measured
+;; 2026-09-10 in en_US.UTF-8 on a file holding `Éclair` and `éclair`:
+;; `/usr/bin/grep -F -i É` answers BOTH lines, because it folds U+00C9 to
+;; U+00E9. This answers one. The divergence is asserted in the suite as a
+;; divergence rather than left for someone to discover.
+(defn fold-from [s :string k :i64] :string
+  (if (> k 25)
+    s
+    (fold-from (string-replace-all
+                s
+                (string-substring "ABCDEFGHIJKLMNOPQRSTUVWXYZ" k (+ k 1))
+                (string-substring "abcdefghijklmnopqrstuvwxyz" k (+ k 1)))
+               (+ k 1))))
+
+(defn fold [s :string] :string
+  (fold-from s 0))
+
+;; Does this line count? For `-i` the NEEDLE arrives already folded -- folding
+;; it once per file rather than once per line -- so only the line is folded
+;; here. For `-v` the answer is inverted, which is the whole flag.
+(defn hit? [line :string needle :string mode :i64] :bool
+  (if (= mode 1)
+    (>= (string-index-of (fold line) needle) 0)
+    (if (= mode 2)
+      (< (string-index-of line needle) 0)
+      (>= (string-index-of line needle) 0))))
+
+;; What a selected line puts on stdout, which is not the same in every mode.
+;;
+;;   -c, -l   nothing here; the file's one line of output is written by `scan`
+;;   -n       PREFIX then the 1-based line number then `:` then the line.
+;;            Measured: `grep -F -n alpha words one` writes `words:1:alpha`,
+;;            so the file prefix comes FIRST and the number second.
+;;   else     PREFIX then the line.
+(defn report [line :string prefix :string mode :i64 state :i64] :i64
+  (if (= mode 4)
+    (do (emit prefix)
+        (emit (decimal-of (quot state (line-unit))))
+        (emit ":")
+        (emit line)
+        (emit (nl))
+        0)
+    (if (> mode 2)
+      0
+      (do (emit prefix) (emit line) (emit (nl)) 0))))
+
+;; One line: advance the line number, and if it counts, report it and advance
+;; the selected count.
+(defn note [line :string needle :string prefix :string mode :i64 state :i64] :i64
+  (let [n (+ state (line-unit))]
+    (if (hit? line needle mode)
+      (do (report line prefix mode n) (+ n 1))
+      n)))
+
+;; Walk the text line by line. Answers the packed state, whose low half is the
+;; number of lines selected.
+;;
+;; The final piece is emitted WITH a newline whether or not the file ended in
+;; one -- that is grep's contract, measured, and it is why this cannot simply
+;; re-emit the matched span of the original bytes.
+(defn walk [text :string needle :string prefix :string mode :i64 state :i64] :i64
+  (let [i (string-index-of text "\n")]
+    (if (< i 0)
+      (if (= (string-byte-length text) 0)
+        state
+        (note text needle prefix mode state))
+      (walk (string-substring text (+ i 1) (string-byte-length text))
+            needle prefix mode
+            (note (string-substring text 0 i) needle prefix mode state)))))
+
 ;; `grep: PATH: No such file or directory`, exit 2 -- grep and sort exit 2
 ;; here where cat, wc, head and uniq exit 1. Measured on each, not copied
 ;; from a sibling.
+;;
+;; An unreadable operand contributes NOTHING to stdout, and that is worth
+;; naming under `-c`: measured, `grep -F -c alpha words missing` writes
+;; `words:2` and no line at all for `missing`. A count of 0 would have been
+;; the plausible wrong answer.
 (defn complain [path :string] :i64
   (do
     (emit-error "grep: ")
@@ -97,9 +199,10 @@ b" 1 2))
 
 ;; --- several operands ----------------------------------------------------
 ;;
-;; With TWO OR MORE files every matching line is prefixed `FILE:`, and with
+;; With TWO OR MORE files every line of output is prefixed `FILE:`, and with
 ;; one it is not. Measured against /usr/bin/grep -F 2026-09-10. The prefix is
-;; the operand exactly as written, not a resolved path.
+;; the operand exactly as written, not a resolved path. It is decided by how
+;; many operands there ARE, not by how many were readable.
 ;;
 ;; The exit status is a three-way worst-of, and its order is the part that is
 ;; easy to get wrong: an unreadable operand (2) beats a match (0), which
@@ -109,11 +212,38 @@ b" 1 2))
 (defn worse [a :i64 b :i64] :i64
   (if (= a 2) 2 (if (= b 2) 2 (if (= a 0) 0 b))))
 
-;; Scanning one file, with the prefix decided by the caller. Returns 0 when
-;; something matched and 1 when nothing did.
-(defn scan [path :string needle :string prefix :string] :i64
-  (if (> (walk (slurp-file path) needle prefix 0) 0) 0 1))
+;; Scanning one file. Returns 0 when something was selected and 1 when
+;; nothing was -- for `-v` that means a line was PRINTED, not that it matched.
+;;
+;; `-c` writes one line PER FILE whether or not anything matched. Measured:
+;; `grep -F -c alpha words one` writes `words:2` and `one:0`, and
+;; `grep -F -c zzz words` writes `0` and still exits 1. The zero is printed;
+;; only the status says nothing was found.
+;;
+;; `-l` writes the file name ONCE however many lines matched -- measured on
+;; `words`, which holds two matches for `alpha` and yields one line -- and
+;; writes the operand rather than a prefix, so it carries no trailing colon.
+(defn scan [path :string needle :string prefix :string mode :i64] :i64
+  ;; `rem` is not on this surface -- measured, not assumed: the compiler
+  ;; answers `unknown operation: rem is not a builtin, a sugar head, or a
+  ;; function of this module`. The low half comes out by subtraction, which
+  ;; is the same shape `decimal-of` already uses for its last digit.
+  (let [state (walk (slurp-file path)
+                    (if (= mode 1) (fold needle) needle)
+                    prefix mode 0)
+        hits (- state (* (quot state (line-unit)) (line-unit)))]
+    (do
+      (if (= mode 3)
+        (do (emit prefix) (emit (decimal-of hits)) (emit (nl)) 0)
+        0)
+      (if (= mode 5)
+        (if (> hits 0) (do (emit path) (emit (nl)) 0) 0)
+        0)
+      (if (> hits 0) 0 1))))
 
+;; The flag is re-derived from argv here rather than carried down: five
+;; parameters is the ceiling, and `mode-of` reads the same argument 0 every
+;; time, so re-deriving costs a capability call and buys a parameter.
 (defn each [i :i64 total :string needle :string prefix? :i64 worst :i64] :i64
   (if (string=? (decimal-of i) total)
     worst
@@ -122,21 +252,43 @@ b" 1 2))
         (each (+ i 1) total needle prefix?
               (worse worst
                      (scan path needle
-                           (if (= prefix? 1) (string-concat path ":") ""))))
+                           (if (= prefix? 1) (string-concat path ":") "")
+                           (mode-of))))
         (each (+ i 1) total needle prefix? (worse worst (complain path)))))))
 
+;; How many arguments there are, as an i64. Wire 38 answers the count as
+;; decimal TEXT, so this counts up until the rendering matches rather than
+;; parsing it.
+(defn argc-from [k :i64 total :string] :i64
+  (if (string=? (decimal-of k) total)
+    k
+    (argc-from (+ k 1) total)))
+
 (defn main [] :i64
-  (let [needle (arg "0")
-        total (arg "")]
-    ;; An empty pattern would trap: string-index-of refuses an empty needle,
-    ;; and that refusal is a language invariant rather than a gap. grep -F ''
-    ;; matches every line; this refuses with exit 2 instead of pretending,
-    ;; and the README says so.
-    (if (= (string-byte-length needle) 0)
+  (let [mode (mode-of)]
+    ;; A dashed argument 0 that is not one of the five. Combining flags is out
+    ;; of scope, and so is every flag this does not implement; refusing is
+    ;; the honest answer where guessing would silently search for the flag.
+    (if (< mode 0)
       2
-      ;; No file operand at all. POSIX grep reads standard input; there is no
-      ;; stdin capability, so this refuses rather than pretending to have
-      ;; read an empty one -- which would exit 1 and look like "no match".
-      (if (string=? total "1")
-        2
-        (each 1 total needle (if (string=? total "2") 0 1) 1)))))
+      (let [n (argc-from 0 (arg ""))
+            ;; Argument 0 is the flag or the pattern, by SHAPE. The pattern
+            ;; sits one before the first file either way.
+            first-file (if (= mode 0) 1 2)]
+        ;; No file operand at all. POSIX grep reads standard input; there is
+        ;; no stdin capability, so this refuses rather than pretending to have
+        ;; read an empty one -- which would exit 1 and look like "no match".
+        ;; Checked BEFORE the pattern is read, so `grep -i` alone never asks
+        ;; wire 38 for an argument that is not there.
+        (if (< n (+ first-file 1))
+          2
+          (let [needle (arg (decimal-of (- first-file 1)))]
+            ;; An empty pattern would trap: string-index-of refuses an empty
+            ;; needle, and that refusal is a language invariant rather than a
+            ;; gap. grep -F '' matches every line; this refuses with exit 2
+            ;; instead of pretending, and the README says so.
+            (if (= (string-byte-length needle) 0)
+              2
+              (each first-file (arg "") needle
+                    (if (> (- n first-file) 1) 1 0)
+                    1))))))))
