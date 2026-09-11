@@ -1,4 +1,4 @@
-;; test/grep_test.cljs — build the command and compare it with the system
+;; test/grep_test.cljk — build the command and compare it with the system
 ;; grep, byte for byte AND by exit status.
 ;;
 ;; The comparison is against `grep -F`, and that is not a convenience. POSIX
