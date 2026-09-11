@@ -41,7 +41,7 @@ and both are tested for it.
 
 ## Measured against the system utility
 
-`test/grep_test.cljs` compiles the guest, packages it, **runs the binary**,
+`test/grep_test.cljk` compiles the guest, packages it, **runs the binary**,
 and compares bytes and exit status. Seventy cases plus one asserted
 divergence, all as measured.
 
