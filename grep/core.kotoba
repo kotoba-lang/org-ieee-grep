@@ -244,17 +244,25 @@ b" 1 2))
         pos (pos-part packed)]
     (if (>= pos n)
       state
-      (let [k (string-index-of (string-substring text pos n) needle)]
+      ;; Every allocating step of a match is its own REGION (arena-scope,
+      ;; ABI v6): the search view, the line walk's views, the reported
+      ;; line's view and the write counts are released as each answers its
+      ;; number, so the recursion carries only scalars and the arena stays
+      ;; where it was after the file was read -- measured 2026-09-16, a
+      ;; 33 MB file with 598,400 matching lines under the loader's DEFAULT
+      ;; 4,096 handles, where the unscoped scan spent four per match.
+      (let [k (arena-scope (string-index-of (string-substring text pos n) needle))]
         (if (< k 0)
           state
-          (let [where (if (= (mode-part packed) 4)
-                        (line-of text pos (+ pos k) (quot state (line-unit)))
-                        (* (line-start text pos (+ pos k) 128) 8388608))
+          (let [where (arena-scope
+                       (if (= (mode-part packed) 4)
+                         (line-of text pos (+ pos k) (quot state (line-unit)))
+                         (* (line-start text pos (+ pos k) 128) 8388608)))
                 start (quot where 8388608)
                 number (- where (* 8388608 (quot where 8388608)))
-                end (line-end text (+ pos k) n)]
+                end (arena-scope (line-end text (+ pos k) n))]
             (do
-              (report (string-substring orig start end) packed number)
+              (arena-scope (report (string-substring orig start end) packed number))
               (scan-hits text orig needle
                          (pack (mode-part packed) (if (prefixed? packed) 1 0)
                                (+ end 1) (file-part packed))
@@ -270,18 +278,21 @@ b" 1 2))
         mode (mode-part packed)]
     (if (>= pos n)
       state
-      (let [end (line-end text pos n)
+      ;; Per line, the same regions as `scan-hits`: under `-i` the folded
+      ;; copy of the line is what the release returns, 26 passes' worth.
+      (let [end (arena-scope (line-end text pos n))
             number (quot state (line-unit))
             hits (- state (* (line-unit) number))
-            found (>= (string-index-of (if (= mode 1)
-                                         (fold (string-substring text pos end))
-                                         (string-substring text pos end))
-                                       needle)
-                      0)
+            found (arena-scope
+                   (>= (string-index-of (if (= mode 1)
+                                          (fold (string-substring text pos end))
+                                          (string-substring text pos end))
+                                        needle)
+                       0))
             selected (if (= mode 2) (not found) found)]
         (do
           (if selected
-            (report (string-substring orig pos end) packed number)
+            (arena-scope (report (string-substring orig pos end) packed number))
             0)
           (scan-lines text orig needle
                       (pack mode (if (prefixed? packed) 1 0) (+ end 1) (file-part packed))

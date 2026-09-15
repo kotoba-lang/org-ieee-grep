@@ -307,8 +307,13 @@
       ;; line), which is the documented slow mode; every other mode spends
       ;; a few handles per MATCH. CPU seconds too -- the fold takes about a
       ;; second of CPU on a loaded machine, and the loader's default is one.
-      (doseq [[out extra] [[exe ["--fuel" "500000000" "--string-pool" "268435456"
-                                 "--pairs" "16777216"
+      ;; The loader's DEFAULT handle budget: with every allocating step of a
+      ;; match a region (arena-scope, ABI v6) the scan holds the text and
+      ;; one match's views, so 80,000 matching lines and the 26-pass fold of
+      ;; each line under -i run in 4,096 handles, where the unscoped guest
+      ;; spent four per match and eighty per folded line.
+      (doseq [[out extra] [[exe ["--fuel" "500000000" "--string-pool" "67108864"
+                                 "--pairs" "4096"
                                  "--cpu-seconds" "60" "--wall-seconds" "600"]]]]
         (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
                                    "--allow" "35,37,38,39"
