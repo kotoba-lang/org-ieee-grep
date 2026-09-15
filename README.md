@@ -54,6 +54,18 @@ line copies per line, because `string-replace-all` rebuilds its result by
 **quadratic** in the pool (a text with 200,000 `e`s trapped), so the fold
 is per line. A host-side fold is the fix, not a rewrite here.
 
+## Every match is a region (2026-09-16)
+
+`(arena-scope body)` — context ABI v6, ADR-2609160044 — releases every
+handle and byte its body allocated when it returns. Each allocating step
+of a match (the search view, the line walk's views, the reported line's
+view and its write counts; under `-i` the 26-pass fold of the line) is one,
+so the recursion carries only scalars and the arena stays where it was
+after the file was read. Measured on the 33 MB file with 598,400 matching
+lines, packaged with the loader's **default 4,096 handles**: completes,
+identical output, 0.43 s user — the unscoped scan spent four handles per
+match and needed millions. The suite packages 4,096 handles.
+
 ## The comparison is `grep -F`, and that is not a convenience
 
 POSIX grep reads its pattern as a basic regular expression; this reads it
