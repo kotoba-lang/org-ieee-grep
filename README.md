@@ -16,6 +16,44 @@ Exit **0** when at least one line was selected, **1** when none was, **2**
 when an operand could not be read. For grep that status *is* the answer, so
 it is asserted alongside the bytes.
 
+## Search the file, not the lines (2026-09-15)
+
+`string-index-of` is a **host slot** since context ABI v5 (amu
+`tools/kexe_loader.c` offset 216, memmem). Until then it was a per-byte
+source rewrite in kotoba-native, and this command — which asked it twice per
+line — measured **75 ns/byte and trapped after 2 MB of a 3.3 MB file**, the
+pair arena spending one handle per byte. Compiling the previous guest with
+the v5 compiler alone already finishes that file.
+
+The guest now has ripgrep's shape: find the **next occurrence** of the
+needle in the whole remaining text with one call, find the line around it
+(the last newline before the hit, looked for in a window that doubles
+backwards; the newline after it), report, continue after that line. Text
+between matches is never walked by this program. `-n` counts newlines
+between matches instead, one call per line crossed. `-v` and `-i` walk every
+line, one call each; `-i` additionally folds each line (26 passes) and is
+the slow mode.
+
+Measured 2026-09-15 on a 33 MB C file (10× amu's loader source), CPU
+seconds, same output as `grep -F` in every row:
+
+| pattern | matches | this grep | `/usr/bin/grep -F` | `rg -F` | previous guest, v5 compiler |
+|---|---|---|---|---|---|
+| `zzzznotthere` | 0 | 0.13 / 0.01 | 0.15 / 0.01 | 0.00 / 0.00 | 0.32 / 0.03 |
+| `SIGILL` | 26,400 | 0.17 / 0.03 | 0.17 / 0.01 | 0.00 / 0.01 | 0.35 / 0.04 |
+| `e` | 598,400 | 0.47 / 0.07 | 0.16 / 0.05 | 0.06 / 0.03 | 0.47 / 0.06 |
+| `-i static_ASSERT` (3.3 MB) | 600 | 0.67 / 0.09 | — | — | 0.66 / 0.07 |
+
+Level with `grep -F` when matches are sparse or absent. What separates this
+from `rg` is the host: the file is copied into the string pool and validated
+as UTF-8 once (about 40 ms of the 130 for the absent case), and libc's
+memmem is not the memchr crate's SIMD. The dense case pays about six host
+calls and three writes per reported line. `-i` pays 26 host calls and 26
+line copies per line, because `string-replace-all` rebuilds its result by
+`string-concat`; folding the whole text once was tried first and is
+**quadratic** in the pool (a text with 200,000 `e`s trapped), so the fold
+is per line. A host-side fold is the fix, not a rewrite here.
+
 ## The comparison is `grep -F`, and that is not a convenience
 
 POSIX grep reads its pattern as a basic regular expression; this reads it
@@ -41,9 +79,12 @@ and both are tested for it.
 
 ## Measured against the system utility
 
-`test/grep_test.cljk` compiles the guest, packages it, **runs the binary**,
-and compares bytes and exit status. Seventy cases plus one asserted
-divergence, all as measured.
+`test/grep_test.cljk` compiles the guest, packages it (`AMU_HOME` must be
+amu of 2026-09-15 or later — the suite refuses a packager that does not echo
+`--cpu-seconds`), **runs the binary**, and compares bytes and exit status.
+Eighty-four cases plus one asserted divergence, all as measured — fourteen
+of them over a generated 80,000-line, 3.4 MB fixture with sparse matches, a
+match on every line, no match, and every flag.
 
 Each earns its place: two matching lines where one is a substring match
 (`alpha` also finds `alphabet`), a no-match file, an *empty* file (not the
