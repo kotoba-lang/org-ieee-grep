@@ -220,7 +220,24 @@
    ["-n" "SIGILL" "big"] ["-c" "e" "big"] ["-c" "zzzz" "big"] ["-l" "SIGILL" "big"]
    ["-v" "e" "big"] ["-v" "SIGILL" "big"]
    ["-i" "static_assert" "big"] ["-i" "zzzz" "big"]
-   ["SIGILL" "big" "words"] ["-n" "SIGILL" "words" "big"]])
+   ["SIGILL" "big" "words"] ["-n" "SIGILL" "words" "big"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 67% of grep's invocations in agent tool use are a later pipeline
+   ;; segment (27,408 of 41,041 measured), and `grep | head` is the most
+   ;; frequent pipeline shape of all (8,593). No `FILE:` prefix; `-l`
+   ;; answers `(standard input)`; `-c` a bare count.
+   {:argv ["alpha"] :stdin "words"}
+   {:argv ["zzz"] :stdin "words"}
+   {:argv ["a"] :stdin "empty"}
+   {:argv ["-n" "alpha"] :stdin "words"}
+   {:argv ["-v" "alpha"] :stdin "words"}
+   {:argv ["-c" "alpha"] :stdin "words"}
+   {:argv ["-c" "zzz"] :stdin "words"}
+   {:argv ["-l" "alpha"] :stdin "words"}
+   {:argv ["-l" "zzz"] :stdin "words"}
+   {:argv ["-i" "ALPHA"] :stdin "words"}
+   {:argv ["e"] :stdin "big"}
+   {:argv ["-c" "e"] :stdin "big"}])
 
 ;; --- where this is NARROWER than the system utility ----------------------
 ;;
@@ -275,7 +292,7 @@
         blob (.join path tmp "grep.bin")
         exe (.join path tmp "grep")
         exe-big (.join path tmp "grep-big")]
-    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
     ;; The fixtures live in the tree the binary is packaged for. The native
     ;; loader refuses a relative request outright, so operands are absolute.
     (let [data (.join path tmp "data")]
@@ -316,7 +333,7 @@
                                  "--pairs" "4096"
                                  "--cpu-seconds" "60" "--wall-seconds" "600"]]]]
         (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
-                                   "--allow" "35,37,38,39"
+                                   "--allow" "35,37,38,39,41"
                                    "--fs-scope" (.realpathSync fs (.join path tmp "data"))
                                    "--output" out]
                                   extra) {})]
@@ -325,7 +342,7 @@
             (refuse "the packager did not echo --cpu-seconds: AMU_HOME predates 2026-09-15 and would bound the scan to one CPU second")))))
     ;; Now the only thing that matters: run it.
     (let [results
-          (for [names cases]
+          (for [case cases]
             ;; [PATTERN FILE...]: the first element is the pattern and
             ;; EVERY remaining one is a path.
             ;;
@@ -336,16 +353,25 @@
             ;; agreed about it -- a suite that could not have failed. The
             ;; giveaway was in the output: cases naming three files printed
             ;; the first file's lines with no `FILE:` prefix anywhere.
-            (let [argv (argv-for names (.realpathSync fs (.join path tmp "data")))
-                  k (run exe argv {})
-                  s (run system-grep (into ["-F"] argv) {})
+            (let [names (if (map? case) (:argv case) case)
+                  ;; A map case names a fixture fed as standard input to BOTH
+                  ;; binaries; as a Buffer, since spawnSync applies :encoding
+                  ;; "buffer" to a string input and node refuses it.
+                  input (when (map? case)
+                          (or (get fixtures (:stdin case))
+                              (refuse (str "no fixture " (:stdin case) " for a stdin case"))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  argv (argv-for names (.realpathSync fs (.join path tmp "data")))
+                  k (run exe argv opts)
+                  s (run system-grep (into ["-F"] argv) opts)
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
                              ;; stderr too: a missing operand differs there
                              ;; and nowhere else, so a suite that compared
                              ;; only stdout and status would call it green.
                              (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
                              (= (:status k) (:status s)))]
-              {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+               :ok same? :kotoba (.toString (:out k) "utf8")
                :system (.toString (:out s) "utf8")
                :exit [(:status k) (:status s)]}))
           ;; The documented -i limit, asserted from BOTH sides. Each of these
