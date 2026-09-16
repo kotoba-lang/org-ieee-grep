@@ -288,11 +288,19 @@ one that does go red while `["-i" "alpha" "blank"]` beside it stays green.
 (39). Fuel, the string arena, the grant and the filesystem scope are
 constants of the packaged binary.
 
+## Standard input
+
+With no file operand `grep` reads standard input (wire 41 `:io/read`,
+2026-09-16) — 67% of how it is invoked in agent tool use (27,408 of 41,041
+over 1,268,018 measured Bash calls), and `grep … | head` is the most frequent
+pipeline shape of all (8,593). No `FILE:` prefix; `-l` answers
+`(standard input)`, `-c` a bare count, exactly as `/usr/bin/grep` does.
+Whole-input form: input larger than the binary's string pool is refused
+(exit 120), never searched short.
+
 ## What this is not
 
 One pattern, one flag. No combining (`-in`, `-vc`), no `-r`, `-q`, `-w`,
-`-x`, `-e` or `-f`, no regular expressions, no reading standard input — with
-no file operand this exits 2 rather than pretending to have read an empty
-stdin, which would exit 1 and look like "no match". `grep -r` over a tree needs the recursive walk that
+`-x`, `-e` or `-f`, no regular expressions. `grep -r` over a tree needs the recursive walk that
 [`org-ieee-find`](https://github.com/kotoba-lang/org-ieee-find) has, and that
 runs into the string arena rather than into anything here.

@@ -308,11 +308,8 @@ b" 1 2))
 ;; `grep -F -c alpha words one` writes `words:2` and `one:0`, and
 ;; `grep -F -c zzz words` writes `0` and still exits 1. `-l` writes the file
 ;; name ONCE however many lines matched, the operand rather than a prefix.
-(defn scan [f :i64 needle :string mode :i64 prefixed :i64] :i64
-  (let [path (arg (decimal-of f))
-        text (slurp-file path)
-        packed (pack mode prefixed 0 f)
-        ;; `-i` searches the folded text and reports from the original.
+(defn scan-text [text :string label :string needle :string mode :i64 packed :i64] :i64
+  (let [;; `-i` searches the folded text and reports from the original.
         state (if (= mode 1)
                 (scan-hits (fold text) text needle packed (line-unit))
                 (if (= mode 2)
@@ -324,9 +321,16 @@ b" 1 2))
         (do (emit-prefix packed) (emit (decimal-of hits)) (emit (nl)) 0)
         0)
       (if (= mode 5)
-        (if (> hits 0) (do (emit path) (emit (nl)) 0) 0)
+        (if (> hits 0) (do (emit label) (emit (nl)) 0) 0)
         0)
       (if (> hits 0) 0 1))))
+
+(defn scan [f :i64 needle :string mode :i64 prefixed :i64] :i64
+  (let [path (arg (decimal-of f))]
+    (scan-text (slurp-file path) path needle mode (pack mode prefixed 0 f))))
+
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
 
 ;; MODE and PREFIXED share a parameter here too: `mode + 8 * prefixed`.
 (defn each [i :i64 total :string needle :string mp :i64 worst :i64] :i64
@@ -350,15 +354,23 @@ b" 1 2))
       2
       (let [n (argc-from 0 (arg ""))
             first-file (if (= mode 0) 1 2)]
-        ;; No file operand at all. POSIX grep reads standard input; there is
-        ;; no stdin capability, so this refuses rather than pretending.
-        (if (< n (+ first-file 1))
+        ;; Fewer arguments than a pattern needs is a usage error, exit 2.
+        (if (< n first-file)
           2
-          (let [needle (arg (decimal-of (- first-file 1)))]
+          (let [needle (arg (decimal-of (- first-file 1)))
+                folded-needle (if (= mode 1) (fold needle) needle)]
             ;; An empty pattern would trap: string-index-of refuses an empty
             ;; needle, in the host as in the language. grep -F '' matches
             ;; every line; this refuses with exit 2 and the README says so.
             (if (= (string-byte-length needle) 0)
               2
-              (each first-file (arg "") (if (= mode 1) (fold needle) needle)
-                    (+ mode (if (> (- n first-file) 1) 8 0)) 1))))))))
+              ;; No file operand: standard input, whole (wire 41, 2026-09-16
+              ;; -- 67% of grep's invocations in agent tool use are a later
+              ;; pipeline segment, 27,408 of 41,041 measured, and `grep |
+              ;; head` is the most frequent pipeline shape of all). No
+              ;; prefix, and `-l` names it `(standard input)` as grep does.
+              ;; Input past the string pool is refused, never searched short.
+              (if (= n first-file)
+                (scan-text (stdin "") "(standard input)" folded-needle mode (pack mode 0 0 0))
+                (each first-file (arg "") folded-needle
+                      (+ mode (if (> (- n first-file) 1) 8 0)) 1)))))))))
