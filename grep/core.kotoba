@@ -189,7 +189,7 @@ b" 1 2))
 ;; call from an offset, no view cut. The needle is a literal -- a handle
 ;; each time it is evaluated -- so each search is a region.
 (defn line-end [text :string i :i64 n :i64] :i64
-  (let [k (arena-scope (string-index-of-from text (nl) i))]
+  (let [k (string-find-byte text 10 i)]
     (if (< k 0) n (if (> k n) n k))))
 
 ;; Walk the newlines in [CUR, HIT): answers `start * 2^23 + line`, where
@@ -197,7 +197,7 @@ b" 1 2))
 ;; that CUR starts a line numbered LINE. One host call per newline crossed,
 ;; which is what `-n` costs and what nothing else pays.
 (defn line-of [text :string cur :i64 hit :i64 line :i64] :i64
-  (let [k (arena-scope (string-index-of-from text (nl) cur))]
+  (let [k (string-find-byte text 10 cur)]
     (if (if (< k 0) true (>= k hit))
       (+ (* cur 8388608) line)
       (line-of text (+ k 1) hit (+ line 1)))))
@@ -206,7 +206,7 @@ b" 1 2))
 ;; the window for the first newline and then for the next after it, until
 ;; none -- one call per newline in the window plus one.
 (defn last-newline [text :string from :i64 hit :i64 seen :i64] :i64
-  (let [k (arena-scope (string-index-of-from text (nl) from))]
+  (let [k (string-find-byte text 10 from)]
     (if (if (< k 0) true (>= k hit))
       seen
       (last-newline text (+ k 1) hit k))))

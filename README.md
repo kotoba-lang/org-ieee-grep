@@ -54,7 +54,9 @@ offset (`string-index-of-from`) and no view is cut per search or per
 line: `e` 0.25 → **0.18** s (rg 0.06), `-n e` 0.34, `-v e` 0.11, `-c e`
 0.12, `-i E` 0.25 → 0.19; the sparse rows unchanged. What remains in the
 dense case is the three writes per reported line and the two searches
-around each match.
+around each match. On context ABI v10 (2026-09-16) the line searches take
+the newline as a BYTE (`string-find-byte`, no needle handle, no region):
+`e` 0.17 → **0.15 s**, `-n e` 0.31.
 
 Ahead of `grep -F` when matches are sparse or absent and under `-i`
 everywhere; behind it, and `rg`, when every line matches, where the cost
