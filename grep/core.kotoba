@@ -28,16 +28,13 @@
 ;; between matches is never walked by this program at all. `-v` is the one
 ;; mode that must look at every line, and does, with one call per line.
 ;;
-;; `-i` is the other mode that walks every line: it folds A-Z to a-z per
-;; LINE (26 `string-replace-all` passes, each one host search) and searches
-;; the folded copy. Folding the whole text once was measured first and
-;; trapped on a 3.3 MB file: `string-replace-all` rebuilds its result by
-;; `string-concat`, which copies the accumulator at every occurrence, so a
-;; fold over a text with 200,000 `e`s is quadratic in the pool. Per line the
-;; occurrences are few. This is the slow mode -- 26 host calls and 26 line
-;; copies per line where the others pay one call per line or per match --
-;; and the README says so; a host-side fold is the fix, not a rewrite here.
-;; ASCII only, also in the README.
+;; `-i` is the SAME walk over a folded copy of the text (2026-09-16,
+;; context ABI v7): `string-fold-ascii` lowers A-Z in one host pass, one
+;; byte to one byte, so an offset into the folded text is the same offset
+;; into the original -- the matches are found in the fold and the lines are
+;; reported from the original. Until then `-i` folded every LINE by 26
+;; `string-replace-all` passes and was the slow mode by a factor of 26.
+;; ASCII only, in the README.
 ;;
 ;; ## The newline grep ADDS
 ;;
@@ -124,24 +121,15 @@ b" 1 2))
         0))))
 
 ;; --- ASCII case folding, and only ASCII ----------------------------------
-;; There is no case-folding builtin on this surface, so `-i` folds by hand:
-;; twenty-six replacements, A-Z to a-z, over the needle and over the WHOLE
-;; text -- once per file, not once per line. This is NARROWER than the
-;; system utility and the README says so. Measured 2026-09-10 in
-;; en_US.UTF-8 on a file holding `Éclair` and `éclair`: `/usr/bin/grep -F
-;; -i É` answers BOTH lines, because it folds U+00C9 to U+00E9. This
-;; answers one. The divergence is asserted in the suite as a divergence.
-(defn fold-from [s :string k :i64] :string
-  (if (> k 25)
-    s
-    (fold-from (string-replace-all
-                s
-                (string-substring "ABCDEFGHIJKLMNOPQRSTUVWXYZ" k (+ k 1))
-                (string-substring "abcdefghijklmnopqrstuvwxyz" k (+ k 1)))
-               (+ k 1))))
-
+;; `string-fold-ascii` (ABI v7) lowers A-Z and keeps every other code
+;; point, over the needle and over the WHOLE text once per file. This is
+;; NARROWER than the system utility and the README says so. Measured
+;; 2026-09-10 in en_US.UTF-8 on a file holding `Éclair` and `éclair`:
+;; `/usr/bin/grep -F -i É` answers BOTH lines, because it folds U+00C9 to
+;; U+00E9. This answers one. The divergence is asserted in the suite as a
+;; divergence.
 (defn fold [s :string] :string
-  (fold-from s 0))
+  (string-fold-ascii s))
 
 ;; --- the packed scalars --------------------------------------------------
 ;; PACKED is `mode + 8 * prefixed + 16 * pos + 16 * 2^40 * f`: MODE 0..5,
@@ -235,10 +223,11 @@ b" 1 2))
       (if (= from floor) floor (line-start text floor hit (* w 2)))
       (+ k 1))))
 
-;; Every mode but `-v` and `-i`: jump to the next occurrence with ONE search
-;; over the remaining text, report the line around it, continue after that
-;; line. STATE is `line * 1e9 + hits` for the line that starts at the
-;; cursor; the line number is only maintained under `-n`.
+;; Every mode but `-v`: jump to the next occurrence with ONE search over
+;; the remaining text, report the line around it, continue after that
+;; line. Under `-i` TEXT is the folded copy and ORIG the original, at the
+;; same offsets. STATE is `line * 1e9 + hits` for the line that starts at
+;; the cursor; the line number is only maintained under `-n`.
 (defn scan-hits [text :string orig :string needle :string packed :i64 state :i64] :i64
   (let [n (string-byte-length text)
         pos (pos-part packed)]
@@ -269,27 +258,20 @@ b" 1 2))
                          (+ (* (+ number 1) (line-unit))
                             (+ (- state (* (line-unit) (quot state (line-unit)))) 1))))))))))
 
-;; `-v` and `-i`: every line, one search each. Under `-v` a line WITHOUT
-;; the needle is selected; under `-i` the FOLDED line is searched for the
-;; folded needle and a line with it is selected.
+;; `-v`: every line, one search each; a line WITHOUT the needle is selected.
 (defn scan-lines [text :string orig :string needle :string packed :i64 state :i64] :i64
   (let [n (string-byte-length text)
         pos (pos-part packed)
         mode (mode-part packed)]
     (if (>= pos n)
       state
-      ;; Per line, the same regions as `scan-hits`: under `-i` the folded
-      ;; copy of the line is what the release returns, 26 passes' worth.
+      ;; Per line, the same regions as `scan-hits`.
       (let [end (arena-scope (line-end text pos n))
             number (quot state (line-unit))
             hits (- state (* (line-unit) number))
             found (arena-scope
-                   (>= (string-index-of (if (= mode 1)
-                                          (fold (string-substring text pos end))
-                                          (string-substring text pos end))
-                                        needle)
-                       0))
-            selected (if (= mode 2) (not found) found)]
+                   (>= (string-index-of (string-substring text pos end) needle) 0))
+            selected (not found)]
         (do
           (if selected
             (arena-scope (report (string-substring orig pos end) packed number))
@@ -325,8 +307,9 @@ b" 1 2))
   (let [path (arg (decimal-of f))
         text (slurp-file path)
         packed (pack mode prefixed 0 f)
+        ;; `-i` searches the folded text and reports from the original.
         state (if (= mode 1)
-                (scan-lines text text needle packed (line-unit))
+                (scan-hits (fold text) text needle packed (line-unit))
                 (if (= mode 2)
                   (scan-lines text text needle packed (line-unit))
                   (scan-hits text text needle packed (line-unit))))

@@ -30,36 +30,40 @@ needle in the whole remaining text with one call, find the line around it
 (the last newline before the hit, looked for in a window that doubles
 backwards; the newline after it), report, continue after that line. Text
 between matches is never walked by this program. `-n` counts newlines
-between matches instead, one call per line crossed. `-v` and `-i` walk every
-line, one call each; `-i` additionally folds each line (26 passes) and is
-the slow mode.
+between matches instead, one call per line crossed. `-v` walks every
+line, one call each. `-i` (2026-09-16, context ABI v7) is the same
+next-occurrence walk over a **folded copy of the text**: `string-fold-ascii`
+lowers A–Z in one host pass, one byte to one byte, so an offset into the
+fold is the same offset into the original — matches are found in the fold
+and lines are reported from the original.
 
-Measured 2026-09-15 on a 33 MB C file (10× amu's loader source), CPU
-seconds, same output as `grep -F` in every row:
+Measured 2026-09-16 on a 33 MB C file (10× amu's loader source), CPU
+seconds user / sys, same output as `grep -F` in every row:
 
-| pattern | matches | this grep | `/usr/bin/grep -F` | `rg -F` | previous guest, v5 compiler |
+| pattern | matches | this grep | `/usr/bin/grep -F` | `rg -F` | this grep, 2026-09-15 |
 |---|---|---|---|---|---|
-| `zzzznotthere` | 0 | 0.13 / 0.01 | 0.15 / 0.01 | 0.00 / 0.00 | 0.32 / 0.03 |
-| `SIGILL` | 26,400 | 0.17 / 0.03 | 0.17 / 0.01 | 0.00 / 0.01 | 0.35 / 0.04 |
-| `e` | 598,400 | 0.47 / 0.07 | 0.16 / 0.05 | 0.06 / 0.03 | 0.47 / 0.06 |
-| `-i static_ASSERT` (3.3 MB) | 600 | 0.67 / 0.09 | — | — | 0.66 / 0.07 |
+| `zzzznotthere` | 0 | 0.02 / 0.01 | 0.14 / 0.00 | 0.00 / 0.01 | 0.13 / 0.01 |
+| `SIGILL` | 26,400 | 0.04 / 0.01 | 0.15 / 0.01 | 0.00 / 0.01 | 0.17 / 0.03 |
+| `e` | 598,400 | 0.25 / 0.02 | 0.15 / 0.03 | 0.05 / 0.03 | 0.47 / 0.07 |
+| `-i static_ASSERT` | 6,000 | 0.06 / 0.02 | 1.02 / 0.02 | 0.01 / 0.00 | 0.67 / 0.09 on 3.3 MB |
+| `-i sigill` | 26,400 | 0.07 / 0.03 | 1.01 / 0.01 | — | — |
+| `-i E` | 614,000 | 0.25 / 0.03 | 0.36 / 0.04 | — | — |
 
-Level with `grep -F` when matches are sparse or absent. What separates this
-from `rg` is the host: the file is copied into the string pool and validated
-as UTF-8 once (about 40 ms of the 130 for the absent case), and libc's
-memmem is not the memchr crate's SIMD. The dense case pays about six host
-calls and three writes per reported line. `-i` pays 26 host calls and 26
-line copies per line, because `string-replace-all` rebuilds its result by
-`string-concat`; folding the whole text once was tried first and is
-**quadratic** in the pool (a text with 200,000 `e`s trapped), so the fold
-is per line. A host-side fold is the fix, not a rewrite here.
+Ahead of `grep -F` when matches are sparse or absent and under `-i`
+everywhere; behind it, and `rg`, when every line matches, where the cost
+is about six host calls and three writes per reported line. What moved
+the absent case from 0.13 to 0.02 is amu's loader: its `memmem` behind
+`string-index-of` had been calling `memcmp` at every haystack offset, and
+is now `memchr` for the first byte and one `memcmp` per candidate
+(2026-09-16). What moved `-i` is the fold: 26 `string-replace-all` passes
+per line became one host pass per file.
 
 ## Every match is a region (2026-09-16)
 
 `(arena-scope body)` — context ABI v6, ADR-2609160044 — releases every
 handle and byte its body allocated when it returns. Each allocating step
 of a match (the search view, the line walk's views, the reported line's
-view and its write counts; under `-i` the 26-pass fold of the line) is one,
+view and its write counts) is one,
 so the recursion carries only scalars and the arena stays where it was
 after the file was read. Measured on the 33 MB file with 598,400 matching
 lines, packaged with the loader's **default 4,096 handles**: completes,
