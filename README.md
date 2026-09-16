@@ -49,6 +49,13 @@ seconds user / sys, same output as `grep -F` in every row:
 | `-i sigill` | 26,400 | 0.07 / 0.03 | 1.01 / 0.01 | — | — |
 | `-i E` | 614,000 | 0.25 / 0.03 | 0.36 / 0.04 | — | — |
 
+Re-measured 2026-09-16 on context ABI v8, where every search runs from an
+offset (`string-index-of-from`) and no view is cut per search or per
+line: `e` 0.25 → **0.18** s (rg 0.06), `-n e` 0.34, `-v e` 0.11, `-c e`
+0.12, `-i E` 0.25 → 0.19; the sparse rows unchanged. What remains in the
+dense case is the three writes per reported line and the two searches
+around each match.
+
 Ahead of `grep -F` when matches are sparse or absent and under `-i`
 everywhere; behind it, and `rg`, when every line matches, where the cost
 is about six host calls and three writes per reported line. What moved

@@ -185,28 +185,31 @@ b" 1 2))
 ;; --- the scan ------------------------------------------------------------
 ;; The byte offset of the newline at or after I in TEXT of length N, or N
 ;; when there is none: the END of the line that starts at or contains I.
+;; Every search here is `string-index-of-from` (context ABI v8): one host
+;; call from an offset, no view cut. The needle is a literal -- a handle
+;; each time it is evaluated -- so each search is a region.
 (defn line-end [text :string i :i64 n :i64] :i64
-  (let [k (string-index-of (string-substring text i n) (nl))]
-    (if (< k 0) n (+ i k))))
+  (let [k (arena-scope (string-index-of-from text (nl) i))]
+    (if (< k 0) n (if (> k n) n k))))
 
 ;; Walk the newlines in [CUR, HIT): answers `start * 2^23 + line`, where
 ;; START is the offset of the line containing HIT and LINE its number, given
 ;; that CUR starts a line numbered LINE. One host call per newline crossed,
 ;; which is what `-n` costs and what nothing else pays.
 (defn line-of [text :string cur :i64 hit :i64 line :i64] :i64
-  (let [k (string-index-of (string-substring text cur hit) (nl))]
-    (if (< k 0)
+  (let [k (arena-scope (string-index-of-from text (nl) cur))]
+    (if (if (< k 0) true (>= k hit))
       (+ (* cur 8388608) line)
-      (line-of text (+ cur (+ k 1)) hit (+ line 1)))))
+      (line-of text (+ k 1) hit (+ line 1)))))
 
 ;; The last newline in [FROM, HIT), or -1: found by searching FORWARD inside
 ;; the window for the first newline and then for the next after it, until
 ;; none -- one call per newline in the window plus one.
 (defn last-newline [text :string from :i64 hit :i64 seen :i64] :i64
-  (let [k (string-index-of (string-substring text from hit) (nl))]
-    (if (< k 0)
+  (let [k (arena-scope (string-index-of-from text (nl) from))]
+    (if (if (< k 0) true (>= k hit))
       seen
-      (last-newline text (+ from (+ k 1)) hit (+ from k)))))
+      (last-newline text (+ k 1) hit k))))
 
 ;; The offset where the line containing HIT starts, without a line count:
 ;; the last newline before HIT, looked for in a window of W bytes ending at
@@ -240,16 +243,16 @@ b" 1 2))
       ;; where it was after the file was read -- measured 2026-09-16, a
       ;; 33 MB file with 598,400 matching lines under the loader's DEFAULT
       ;; 4,096 handles, where the unscoped scan spent four per match.
-      (let [k (arena-scope (string-index-of (string-substring text pos n) needle))]
+      (let [k (string-index-of-from text needle pos)]
         (if (< k 0)
           state
           (let [where (arena-scope
                        (if (= (mode-part packed) 4)
-                         (line-of text pos (+ pos k) (quot state (line-unit)))
-                         (* (line-start text pos (+ pos k) 128) 8388608)))
+                         (line-of text pos k (quot state (line-unit)))
+                         (* (line-start text pos k 128) 8388608)))
                 start (quot where 8388608)
                 number (- where (* 8388608 (quot where 8388608)))
-                end (arena-scope (line-end text (+ pos k) n))]
+                end (line-end text k n)]
             (do
               (arena-scope (report (string-substring orig start end) packed number))
               (scan-hits text orig needle
@@ -266,11 +269,13 @@ b" 1 2))
     (if (>= pos n)
       state
       ;; Per line, the same regions as `scan-hits`.
-      (let [end (arena-scope (line-end text pos n))
+      ;; The needle holds no newline, so a match starting before END lies
+      ;; inside the line.
+      (let [end (line-end text pos n)
             number (quot state (line-unit))
             hits (- state (* (line-unit) number))
-            found (arena-scope
-                   (>= (string-index-of (string-substring text pos end) needle) 0))
+            k (string-index-of-from text needle pos)
+            found (if (< k 0) false (< k end))
             selected (not found)]
         (do
           (if selected
