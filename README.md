@@ -311,9 +311,32 @@ resuming after the match; under `-i` the original text of the match; with
 grep does. `-h` drops the `FILE:` prefix; `-q` prints nothing. 40 cases
 added, 136 compared in all, byte-identical.
 
+## Regular expressions
+
+Since 2026-09-17 a pattern with a metacharacter is a POSIX BRE, and under
+`-E` an ERE, matched by [`org-ieee-regex`](https://github.com/kotoba-lang/org-ieee-regex)
+(linked with `--source-path`; the suite reads `REGEX_HOME`, default the
+sibling checkout). `-F` keeps a metacharacter literal. Measured over
+1,268,018 agent Bash calls: `grep -E` is 9,582 of them, shaped as
+alternations of words (`W|W`, `^(W|W)`, `^W |W`). 40 regex cases compared
+against `/usr/bin/grep` (without `-F`), every flag with a regex, BRE vs ERE.
+
+Three paths, in order of cost: a pattern with no metacharacter (and every
+`-F` pattern) takes the literal path — one host search per occurrence; a
+regex whose top-level alternatives all begin with a literal is *prefiltered*
+— a line is simulated only when a host search finds one of those prefixes
+in it (`SIGILL|static_assert` on 5.4 MB: 0.15 s user, `/usr/bin/grep`
+0.13 s); any other regex is simulated on every line (`e+ in`: 4 s). The
+prefilter is bounded to the line — its first cut searched the rest of the
+file from each line and was quadratic.
+
+One rule of the linked-module route, learned here: a capability call is
+admitted only as a function's *result* — `(string=? (typed-cap-call …) "1")`
+is refused once the namespace has a `:require`.
+
 ## What this is not
 
-One pattern. No `-r`, `-w`, `-x`, `-e`, `-f`, `-A/-B/-C`, no regular
-expressions (`-E`). `grep -r` over a tree needs the recursive walk that
+One pattern. No `-r`, `-w`, `-x`, `-e`, `-f`, `-A/-B/-C`, no back-references
+in a pattern. `grep -r` over a tree needs the recursive walk that
 [`org-ieee-find`](https://github.com/kotoba-lang/org-ieee-find) has, and that
 runs into the string arena rather than into anything here.
