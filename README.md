@@ -298,9 +298,22 @@ pipeline shape of all (8,593). No `FILE:` prefix; `-l` answers
 Whole-input form: input larger than the binary's string pool is refused
 (exit 120), never searched short.
 
+## Flags combine; `-o`, `-h`, `-q`
+
+Since 2026-09-17 the mode is a bit set — `-in`, `-i -n`, `-vc`, `-oin`, any
+spelling of a set of {i, v, c, n, l, o, h, q} — and `--` ends the flags.
+Measured over 1,268,018 agent Bash calls: `-n` 17,633, `-c` 7,822, `-v`
+6,234, `-o` 3,183, `-i` 2,929, and every combination was an unknown flag
+here while each letter alone was accepted. `-o` prints the match, every
+match on a line (`grep -o a` over `aa` prints two lines), the cursor
+resuming after the match; under `-i` the original text of the match; with
+`-c`/`-l`/`-q` it changes nothing, and with `-v` the lines print, as BSD
+grep does. `-h` drops the `FILE:` prefix; `-q` prints nothing. 40 cases
+added, 136 compared in all, byte-identical.
+
 ## What this is not
 
-One pattern, one flag. No combining (`-in`, `-vc`), no `-r`, `-q`, `-w`,
-`-x`, `-e` or `-f`, no regular expressions. `grep -r` over a tree needs the recursive walk that
+One pattern. No `-r`, `-w`, `-x`, `-e`, `-f`, `-A/-B/-C`, no regular
+expressions (`-E`). `grep -r` over a tree needs the recursive walk that
 [`org-ieee-find`](https://github.com/kotoba-lang/org-ieee-find) has, and that
 runs into the string arena rather than into anything here.

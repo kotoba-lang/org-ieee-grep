@@ -67,6 +67,7 @@
 ;; implementation passes everything else without.
 (def fixtures
   {"words"  "alpha\nbeta\ngamma\nalphabet\n"
+   "dashes" "-x marks\nplain\n--x\n"
    "none"   "no match here\n"
    "empty"  ""
    "one"    "x\n"
@@ -237,7 +238,27 @@
    {:argv ["-l" "zzz"] :stdin "words"}
    {:argv ["-i" "ALPHA"] :stdin "words"}
    {:argv ["e"] :stdin "big"}
-   {:argv ["-c" "e"] :stdin "big"}])
+   {:argv ["-c" "e"] :stdin "big"}
+   ;; --- combined flags, -o, -h, -q (2026-09-17) ---------------------------
+   ;; Measured: -n 17,633, -c 7,822, -v 6,234, -o 3,183, -i 2,929; the
+   ;; combinations were an unknown flag here. Every spelling of a set.
+   ["-in" "ALPHA" "words"] ["-i" "-n" "ALPHA" "words"] ["-ni" "ALPHA" "words"]
+   ["-vc" "alpha" "words"] ["-cv" "alpha" "words"] ["-vn" "alpha" "words"] ["-vi" "ALPHA" "words"]
+   ["-cn" "alpha" "words" "one"] ["-nl" "alpha" "words" "one"] ["-il" "ALPHA" "words" "one"]
+   ["-inc" "ALPHA" "words"] ["-vcn" "alpha" "words"]
+   ;; -o: the match, every match, one per line; with -n, -i, -c, -v, -l.
+   ["-o" "a" "words"] ["-o" "alpha" "words"] ["-on" "a" "words"] ["-no" "a" "words"]
+   ["-oi" "A" "words"] ["-oc" "a" "words"] ["-ov" "a" "words"] ["-ol" "a" "words" "one"]
+   ["-o" "a" "words" "one"] ["-oin" "A" "words" "one"] ["-o" "zzz" "words"]
+   ;; -h: no FILE: prefix with several operands (alone and with -n, -c).
+   ["-h" "alpha" "words" "one"] ["-hn" "alpha" "words" "one"] ["-hc" "alpha" "words" "one"] ["-ho" "a" "words" "one"]
+   ;; -q: nothing printed, the status only; with a missing operand too.
+   ["-q" "alpha" "words"] ["-q" "zzz" "words"] ["-qn" "alpha" "words"] ["-q" "alpha" "missing"] ["-qc" "zzz" "words"]
+   ;; -- ends the flags: a pattern that begins with a dash.
+   ["--" "-x" "dashes"] ["-n" "--" "-x" "dashes"]
+   {:argv ["-on" "a"] :stdin "words"}
+   {:argv ["-o" "a"] :stdin "words"} {:argv ["-in" "ALPHA"] :stdin "words"} {:argv ["-oc" "e"] :stdin "big"}
+   {:argv ["-q" "alpha"] :stdin "words"} {:argv ["-vc" "e"] :stdin "big"}])
 
 ;; --- where this is NARROWER than the system utility ----------------------
 ;;
@@ -270,9 +291,11 @@
 ;; This is the line that stopped the suite from being able to fail once
 ;; already -- see the note below on the twelve multi-operand cases.
 (defn- argv-for [names data]
-  (let [flagged? (str/starts-with? (first names) "-")
-        head (if flagged? (take 2 names) (take 1 names))
-        files (if flagged? (drop 2 names) (drop 1 names))]
+  ;; Every leading flag (a dash and letters) then the pattern, then files.
+  (let [nflags (count (take-while #(and (str/starts-with? % "-") (not= % "--")) names))
+        after-dd (if (= "--" (nth names nflags nil)) 1 0)
+        head (take (+ nflags after-dd 1) names)
+        files (drop (+ nflags after-dd 1) names)]
     (into (vec head) (map #(.join path data %) files))))
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
