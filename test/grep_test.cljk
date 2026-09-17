@@ -41,6 +41,12 @@
 
 (def system-grep "/usr/bin/grep")
 
+;; The regex engine this links: org-ieee-regex, a sibling checkout by default.
+(def regex-home
+  (or (.-REGEX_HOME js/process.env)
+      (let [guess (.resolve path (.cwd js/process) ".." "org-ieee-regex")]
+        (when (.existsSync fs (.join path guess "regex" "core.kotoba")) guess))))
+
 ;; A directory of fixtures, and the cases over them. Each case is an argv,
 ;; and each is here because it separates a right implementation from a wrong
 ;; one that passes the others:
@@ -67,6 +73,7 @@
 ;; implementation passes everything else without.
 (def fixtures
   {"words"  "alpha\nbeta\ngamma\nalphabet\n"
+   "dots"   "a.b\naxb\n[b]\n"
    "dashes" "-x marks\nplain\n--x\n"
    "none"   "no match here\n"
    "empty"  ""
@@ -258,7 +265,27 @@
    ["--" "-x" "dashes"] ["-n" "--" "-x" "dashes"]
    {:argv ["-on" "a"] :stdin "words"}
    {:argv ["-o" "a"] :stdin "words"} {:argv ["-in" "ALPHA"] :stdin "words"} {:argv ["-oc" "e"] :stdin "big"}
-   {:argv ["-q" "alpha"] :stdin "words"} {:argv ["-vc" "e"] :stdin "big"}])
+   {:argv ["-q" "alpha"] :stdin "words"} {:argv ["-vc" "e"] :stdin "big"}
+   ;; --- regular expressions (2026-09-17, org-ieee-regex) ------------------
+   ;; A :re case is compared WITHOUT -F. The measured shapes first: word
+   ;; alternation, anchored alternation, +, ., classes; then each flag with
+   ;; a regex, BRE (plain grep) vs ERE (-E), and -F on a metacharacter.
+   [:re ["-E" "alpha|gamma" "words"]] [:re ["-E" "^(alpha|beta)" "words"]] [:re ["-E" "^beta |gamma" "words"]]
+   [:re ["-E" "a+" "words"]] [:re ["-E" "al.ha" "words"]] [:re ["-E" "^a.*t$" "words"]] [:re ["-E" "[bg]" "words"]]
+   [:re ["-E" "[[:upper:]]" "words"]] [:re ["-E" "ph?a" "words"]] [:re ["-E" "a{2}" "words"]] [:re ["-E" "z{0,1}gam" "words"]]
+   [:re ["-En" "alpha|gamma" "words"]] [:re ["-Ec" "a" "words"]] [:re ["-Ev" "a" "words"]] [:re ["-El" "^b" "words" "one"]]
+   [:re ["-Ei" "ALPHA|GAMMA" "words"]] [:re ["-Eo" "[a-z]+a" "words"]] [:re ["-Eo" "a." "words"]] [:re ["-Eon" "a." "words"]]
+   [:re ["-E" "alpha|gamma" "words" "one"]] [:re ["-Eh" "alpha" "words" "one"]] [:re ["-Eq" "gam+a" "words"]]
+   [:re ["-E" "SIGILL|static_assert" "big"]] [:re ["-Ec" "e+ " "big"]] [:re ["-En" "^line 1[0-9]* " "big"]]
+   ;; BRE: plain grep. `a+` is literal there; `\+` quantifies.
+   [:re ["alp.a" "words"]] [:re ["^beta$" "words"]] [:re ["a\\+" "words"]] [:re ["a+" "words"]] [:re ["\\(al\\)" "words"]]
+   [:re ["[a-c]et" "words"]] [:re ["-n" "a.*a" "words"]] [:re ["-c" "^" "words"]] [:re ["-v" "^a" "words"]]
+   ;; -F keeps a metacharacter literal; a . in the fixture proves it.
+   [:re ["-F" "a." "dots"]] [:re ["-F" "[b]" "dots"]] [:re ["a." "dots"]]
+   ;; Invalid patterns: exit 2 on both sides (the message is compared as
+   ;; a divergence below, not here).
+   [:re {:argv ["-E" "alpha|gamma"] :stdin "words"}] [:re {:argv ["-Eo" "[a-z]+"] :stdin "words"}]
+   [:re {:argv ["-E" "^(alpha|beta)"] :stdin "words"}] [:re {:argv ["a.*a"] :stdin "words"}]])
 
 ;; --- where this is NARROWER than the system utility ----------------------
 ;;
@@ -324,7 +351,9 @@
         (.writeFileSync fs (.join path data name)
                         content
                         "utf8")))
-    (let [c (run "node" [amu "compile" src "--target" "aarch64-macos" "--jvm-free"
+    (when-not regex-home (refuse "set REGEX_HOME to an org-ieee-regex checkout"))
+    (let [c (run "node" [amu "compile" src "--source-path" (.resolve path (.cwd js/process))
+                         "--source-path" regex-home "--target" "aarch64-macos" "--jvm-free"
                          "--policy" policy "--output" kexe] {})]
       (when (not= 0 (:status c))
         (refuse (str "compile failed: " (str (:err c)) (str (:out c))))))
@@ -352,20 +381,20 @@
       ;; one match's views, so 80,000 matching lines and the 26-pass fold of
       ;; each line under -i run in 4,096 handles, where the unscoped guest
       ;; spent four per match and eighty per folded line.
-      (doseq [[out extra] [[exe ["--fuel" "500000000" "--string-pool" "67108864"
-                                 "--pairs" "4096"
-                                 "--cpu-seconds" "60" "--wall-seconds" "600"]]]]
+      (doseq [[out extra] [[exe ["--fuel" "4000000000" "--string-pool" "67108864"
+                                 "--pairs" "65536"
+                                 "--cpu-seconds" "600" "--wall-seconds" "600"]]]]
         (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
                                    "--allow" "35,37,38,39,41"
                                    "--fs-scope" (.realpathSync fs (.join path tmp "data"))
                                    "--output" out]
                                   extra) {})]
           (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p)))))
-          (when-not (re-find #":cpu-seconds \"60\"" (str (:out p)))
+          (when-not (re-find #":cpu-seconds \"600\"" (str (:out p)))
             (refuse "the packager did not echo --cpu-seconds: AMU_HOME predates 2026-09-15 and would bound the scan to one CPU second")))))
     ;; Now the only thing that matters: run it.
     (let [results
-          (for [case cases]
+          (for [case0 cases]
             ;; [PATTERN FILE...]: the first element is the pattern and
             ;; EVERY remaining one is a path.
             ;;
@@ -376,7 +405,9 @@
             ;; agreed about it -- a suite that could not have failed. The
             ;; giveaway was in the output: cases naming three files printed
             ;; the first file's lines with no `FILE:` prefix anywhere.
-            (let [names (if (map? case) (:argv case) case)
+            (let [re? (and (vector? case0) (= :re (first case0)))
+                  case (if re? (second case0) case0)
+                  names (if (map? case) (:argv case) case)
                   ;; A map case names a fixture fed as standard input to BOTH
                   ;; binaries; as a Buffer, since spawnSync applies :encoding
                   ;; "buffer" to a string input and node refuses it.
@@ -385,15 +416,19 @@
                               (refuse (str "no fixture " (:stdin case) " for a stdin case"))))
                   opts (if input {:input (js/Buffer.from input "utf8")} {})
                   argv (argv-for names (.realpathSync fs (.join path tmp "data")))
-                  k (run exe argv opts)
-                  s (run system-grep (into ["-F"] argv) opts)
+                  ;; A :re case is compared without -F: the pattern is a
+                  ;; regular expression on both sides. Every other case is
+                  ;; a fixed string on BOTH sides -- since 2026-09-17 a plain
+                  ;; pattern is a BRE here too, so `-F` goes to both.
+                  k (run exe (if re? argv (into ["-F"] argv)) opts)
+                  s (run system-grep (if re? argv (into ["-F"] argv)) opts)
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
                              ;; stderr too: a missing operand differs there
                              ;; and nowhere else, so a suite that compared
                              ;; only stdout and status would call it green.
                              (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
                              (= (:status k) (:status s)))]
-              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case) (when re? :re)] (if re? [:re names] names))
                :ok same? :kotoba (.toString (:out k) "utf8")
                :system (.toString (:out s) "utf8")
                :exit [(:status k) (:status s)]}))
@@ -406,7 +441,7 @@
           (for [d divergences]
             (let [data (.realpathSync fs (.join path tmp "data"))
                   argv (argv-for (:argv d) data)
-                  k (.toString (:out (run exe argv {})) "utf8")
+                  k (.toString (:out (run exe (into ["-F"] argv) {})) "utf8")
                   y (.toString (:out (run system-grep (into ["-F"] argv) {})) "utf8")]
               {:argv (:argv d) :why (:why d)
                :ok (and (= k (:kotoba d)) (= y (:system d)) (not= k y))
